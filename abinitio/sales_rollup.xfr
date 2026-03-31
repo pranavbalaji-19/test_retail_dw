@@ -1,0 +1,241 @@
+-- =============================================================================
+-- Ab Initio Graph Definition (XFR)
+-- Project   : retail_sales_transform
+-- Graph     : sales_rollup.xfr
+-- Purpose   : Transforms raw sales transactions into regional daily summaries.
+--             Components: Input > Filter > Reformat > Join > Rollup > Output
+--             Equivalents: Reformat=SELECT/CASE, Rollup=GROUP BY/SUM/COUNT
+-- =============================================================================
+
+[graph]
+name = "sales_rollup"
+description = "Regional daily sales rollup and enrichment"
+dml_file = "retail_sales.dml"
+parallelism = ${AB_PARALLELISM:-4}
+
+-- ============================================================
+-- COMPONENT 1: Input - Read from Oracle staging table
+-- Equivalent SQL: SELECT * FROM STG_SALES_TRANSACTIONS WHERE ...
+-- ============================================================
+[component "read_stg_transactions"]
+type = "read_oracle"
+table = "STG_SALES_TRANSACTIONS"
+where_clause = "TRANSACTION_DATE = TO_DATE('${LOAD_DATE}','YYYY-MM-DD') AND REGION_CODE = '${REGION_CODE}' AND ETL_STATUS = 'PENDING'"
+output_schema = "stg_sales_record"
+fetch_size = 10000
+connection = "${ORA_CONNECT_STRING}"
+
+-- ============================================================
+-- COMPONENT 2: Filter - Remove invalid / zero-amount records
+-- Equivalent SQL: WHERE quantity > 0 AND unit_price > 0
+-- ============================================================
+[component "filter_valid_transactions"]
+type = "filter"
+input  = "read_stg_transactions.out"
+output[0] = "valid_records"       -- pass port: quantity > 0
+output[1] = "invalid_records"     -- reject port: quantity <= 0 or price = 0
+
+filter_expression = <<FILTER_EXPR
+    out[0] = (quantity > 0.0) AND (unit_price > 0.0) AND (product_id IS NOT NULL);
+    out[1] = NOT out[0];
+FILTER_EXPR
+
+-- ============================================================
+-- COMPONENT 3: Reformat - Derive calculated fields
+-- Equivalent SQL: SELECT t.*, quantity*unit_price AS gross_amount,
+--                        CASE WHEN currency_code='USD' THEN ...
+--                        TO_NUMBER(TO_CHAR(transaction_date,'YYYY')) AS fiscal_year
+-- ============================================================
+[component "reformat_enrich_fields"]
+type = "reformat"
+input  = "filter_valid_transactions.out[0]"
+output = "enriched_for_join"
+input_schema  = "stg_sales_record"
+output_schema = "stg_sales_record"  -- extended inline below
+
+transform = <<REFORMAT_EXPR
+    out.transaction_id   = in.transaction_id;
+    out.customer_id      = in.customer_id;
+    out.product_id       = in.product_id;
+    out.store_id         = in.store_id;
+    out.transaction_date = in.transaction_date;
+    out.quantity         = in.quantity;
+    out.unit_price       = in.unit_price;
+    out.discount_amt     = NVL(in.discount_amt, 0.0);
+
+    -- Derived: gross amount before discount
+    out.gross_amount     = in.quantity * in.unit_price;
+
+    -- Derived: net amount after discount
+    out.net_amount       = (in.quantity * in.unit_price) - NVL(in.discount_amt, 0.0);
+
+    -- Derived: fiscal period from transaction date
+    out.fiscal_year      = year(in.transaction_date);
+    out.fiscal_month     = month(in.transaction_date);
+
+    -- Normalise region code
+    out.region_code      = upper(trim(in.region_code));
+
+    -- Currency handling: convert USD to GBP using fixed rate (legacy approach)
+    out.currency_code = CASE in.currency_code
+        WHEN 'USD' THEN 'GBP'
+        WHEN 'EUR' THEN 'GBP'
+        ELSE in.currency_code
+    END;
+
+    -- Loyalty tier normalisation
+    out.loyalty_tier = CASE
+        WHEN in.unit_price * in.quantity > 500.0 THEN 'PREMIUM'
+        WHEN in.unit_price * in.quantity > 100.0 THEN 'STANDARD'
+        ELSE 'BASIC'
+    END;
+REFORMAT_EXPR
+
+-- ============================================================
+-- COMPONENT 4: Read Lookup - DIM_PRODUCT current records
+-- Equivalent SQL: SELECT product_id, product_code, category_code FROM DIM_PRODUCT WHERE is_current='Y'
+-- ============================================================
+[component "read_dim_product_lookup"]
+type = "read_oracle"
+table = "DIM_PRODUCT"
+where_clause = "IS_CURRENT = 'Y'"
+output_schema = "product_dim_lookup"
+connection = "${ORA_CONNECT_STRING}"
+
+-- ============================================================
+-- COMPONENT 5: Join - Enrich transactions with product dimension
+-- Equivalent SQL: LEFT JOIN DIM_PRODUCT dp ON dp.product_id = t.product_id AND dp.is_current='Y'
+-- ============================================================
+[component "join_product_dim"]
+type = "join"
+input[0] = "reformat_enrich_fields.out"          -- left: transactions (driving)
+input[1] = "read_dim_product_lookup.out"          -- right: dimension lookup
+output[0] = "joined_records"                      -- matched
+output[1] = "unmatched_transactions"              -- unmatched (no dim record)
+
+join_keys[0] = "product_id"
+join_keys[1] = "product_id"
+join_type = "left_outer"
+
+output_schema = "enriched_sales_record"
+
+merge_transform = <<JOIN_MERGE
+    out.transaction_id   = left.transaction_id;
+    out.customer_id      = left.customer_id;
+    out.product_id       = left.product_id;
+    out.product_code     = NVL(right.product_code, 'UNKNOWN');
+    out.product_name     = NVL(right.product_name, 'UNKNOWN PRODUCT');
+    out.category_code    = NVL(right.category_code, 'UNCATEGORISED');
+    out.subcategory_code = NVL(right.subcategory_code, 'NONE');
+    out.store_id         = left.store_id;
+    out.transaction_date = left.transaction_date;
+    out.quantity         = left.quantity;
+    out.unit_price       = left.unit_price;
+    out.discount_amt     = left.discount_amt;
+    out.gross_amount     = left.gross_amount;
+    out.net_amount       = left.net_amount;
+    out.region_code      = left.region_code;
+    out.currency_code    = left.currency_code;
+    out.loyalty_tier     = left.loyalty_tier;
+    out.fiscal_year      = left.fiscal_year;
+    out.fiscal_month     = left.fiscal_month;
+JOIN_MERGE
+
+-- ============================================================
+-- COMPONENT 6: Rollup - Aggregate to regional/category daily summary
+-- Equivalent SQL:
+--   SELECT region_code, summary_date, category_code,
+--          COUNT(*) AS total_transactions,
+--          SUM(quantity) AS total_quantity,
+--          SUM(gross_amount) AS total_gross_revenue,
+--          SUM(net_amount)   AS total_net_revenue,
+--          SUM(discount_amt) AS total_discount_amount,
+--          AVG(net_amount)   AS avg_basket_value,
+--          COUNT(DISTINCT customer_id) AS distinct_customers,
+--          COUNT(DISTINCT product_id)  AS distinct_products,
+--          COUNT(DISTINCT store_id)    AS distinct_stores
+--   FROM   enriched_transactions
+--   GROUP BY region_code, transaction_date, category_code, fiscal_year, fiscal_month
+-- ============================================================
+[component "rollup_regional_summary"]
+type = "rollup"
+input  = "join_product_dim.out[0]"
+output = "aggregated_summaries"
+input_schema  = "enriched_sales_record"
+output_schema = "regional_summary_record"
+
+group_by = "region_code, transaction_date, category_code, fiscal_year, fiscal_month"
+
+aggregate = <<ROLLUP_EXPR
+    initialise:
+        out.region_code           = in.region_code;
+        out.summary_date          = in.transaction_date;
+        out.category_code         = in.category_code;
+        out.fiscal_year           = in.fiscal_year;
+        out.fiscal_month          = in.fiscal_month;
+        out.total_transactions    = 0;
+        out.total_quantity        = 0.0;
+        out.total_gross_revenue   = 0.0;
+        out.total_net_revenue     = 0.0;
+        out.total_discount_amount = 0.0;
+        out.avg_basket_value      = 0.0;
+        out.distinct_customers    = 0;
+        out.distinct_products     = 0;
+        out.distinct_stores       = 0;
+
+    aggregate:
+        out.total_transactions    += 1;
+        out.total_quantity        += in.quantity;
+        out.total_gross_revenue   += in.gross_amount;
+        out.total_net_revenue     += in.net_amount;
+        out.total_discount_amount += in.discount_amt;
+        -- Note: distinct counts approximated; exact distinct handled in output SQL
+        out.distinct_customers    = max(out.distinct_customers, in.customer_id);
+        out.distinct_products     = max(out.distinct_products,  in.product_id);
+        out.distinct_stores       = max(out.distinct_stores,    in.store_id);
+
+    finalise:
+        out.avg_basket_value = out.total_net_revenue / max(out.total_transactions, 1);
+ROLLUP_EXPR
+
+-- ============================================================
+-- COMPONENT 7: Write Output - Write summary to FACT_REGIONAL_SUMMARY
+-- ============================================================
+[component "write_regional_summary"]
+type = "write_oracle"
+input  = "rollup_regional_summary.out"
+table  = "FACT_REGIONAL_SUMMARY"
+mode   = "insert_append"
+connection = "${ORA_CONNECT_STRING}"
+
+column_mapping = <<COL_MAP
+    region_code           -> REGION_CODE
+    summary_date          -> SUMMARY_DATE
+    total_transactions    -> TOTAL_TRANSACTIONS
+    total_quantity        -> TOTAL_QUANTITY
+    total_gross_revenue   -> TOTAL_REVENUE
+    avg_basket_value      -> AVG_BASKET_SIZE
+    distinct_customers    -> DISTINCT_CUSTOMERS
+    distinct_products     -> DISTINCT_PRODUCTS
+    fiscal_year           -> (not mapped - handled by sequence)
+    fiscal_month          -> (not mapped)
+COL_MAP
+
+-- ============================================================
+-- COMPONENT 8: Write Rejected Records to error log file
+-- ============================================================
+[component "write_rejected_records"]
+type = "write_file"
+input  = "filter_valid_transactions.out[1]"
+path   = "/opt/etl/errors/retail_rejected_${REGION_CODE}_${LOAD_DATE}.dat"
+format = "delimited"
+delimiter = "|"
+
+[flow]
+read_stg_transactions  -> filter_valid_transactions
+filter_valid_transactions[0] -> reformat_enrich_fields
+filter_valid_transactions[1] -> write_rejected_records
+reformat_enrich_fields -> join_product_dim[0]
+read_dim_product_lookup -> join_product_dim[1]
+join_product_dim[0]    -> rollup_regional_summary
+rollup_regional_summary -> write_regional_summary

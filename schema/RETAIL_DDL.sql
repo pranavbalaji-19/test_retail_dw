@@ -1,0 +1,213 @@
+-- =============================================================================
+-- RETAIL DATA WAREHOUSE - Oracle 19c DDL
+-- System: Legacy POS Integration Layer
+-- Owner: DW_ADMIN
+-- Last Modified: 2024-01-15
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- STAGING TABLES (Raw ingestion from POS source systems)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE STG_SALES_TRANSACTIONS (
+    TRANSACTION_ID      NUMBER(12)     NOT NULL,
+    CUSTOMER_ID         NUMBER(10)     NOT NULL,
+    PRODUCT_ID          NUMBER(8)      NOT NULL,
+    STORE_ID            NUMBER(6)      NOT NULL,
+    TRANSACTION_DATE    DATE           NOT NULL,
+    QUANTITY            NUMBER(8,2),
+    UNIT_PRICE          NUMBER(12,4),
+    DISCOUNT_AMT        NUMBER(12,4)   DEFAULT 0,
+    DISCOUNT_PCT        NUMBER(5,2)    DEFAULT 0,
+    REGION_CODE         VARCHAR2(10)   NOT NULL,
+    CURRENCY_CODE       VARCHAR2(3)    DEFAULT 'GBP',
+    PAYMENT_METHOD      VARCHAR2(20),
+    POS_TERMINAL_ID     VARCHAR2(20),
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    LOAD_BATCH_ID       NUMBER(10),
+    SOURCE_FILE_NAME    VARCHAR2(200),
+    ETL_STATUS          VARCHAR2(20)   DEFAULT 'PENDING',
+    ERROR_MSG           VARCHAR2(500),
+    CONSTRAINT PK_STG_SALES PRIMARY KEY (TRANSACTION_ID)
+);
+
+CREATE TABLE STG_PRODUCT_MASTER (
+    PRODUCT_ID          NUMBER(8)      NOT NULL,
+    PRODUCT_CODE        VARCHAR2(20)   NOT NULL,
+    PRODUCT_NAME        VARCHAR2(200),
+    CATEGORY_CODE       VARCHAR2(10),
+    SUBCATEGORY_CODE    VARCHAR2(10),
+    SUPPLIER_ID         NUMBER(8),
+    COST_PRICE          NUMBER(12,4),
+    LIST_PRICE          NUMBER(12,4),
+    TAX_CLASS_CODE      VARCHAR2(10),
+    WEIGHT_KG           NUMBER(8,3),
+    IS_ACTIVE           CHAR(1)        DEFAULT 'Y',
+    EFFECTIVE_DATE      DATE,
+    EXPIRY_DATE         DATE,
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    CONSTRAINT PK_STG_PRODUCT PRIMARY KEY (PRODUCT_ID)
+);
+
+-- Shared staging table - also referenced by CRM repo (crm_analytics_legacy)
+CREATE TABLE STG_CUSTOMER_SALES (
+    CUSTOMER_ID         NUMBER(10)     NOT NULL,
+    CUSTOMER_CODE       VARCHAR2(20)   NOT NULL,
+    FIRST_NAME          VARCHAR2(100),
+    LAST_NAME           VARCHAR2(100),
+    EMAIL               VARCHAR2(200),
+    PHONE               VARCHAR2(30),
+    REGION_CODE         VARCHAR2(10),
+    LOYALTY_TIER        VARCHAR2(20),
+    LIFETIME_VALUE      NUMBER(14,2),
+    REGISTRATION_DATE   DATE,
+    LAST_PURCHASE_DATE  DATE,
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    CONSTRAINT PK_STG_CUSTOMER PRIMARY KEY (CUSTOMER_ID)
+);
+
+CREATE TABLE STG_STORE_MASTER (
+    STORE_ID            NUMBER(6)      NOT NULL,
+    STORE_CODE          VARCHAR2(10)   NOT NULL,
+    STORE_NAME          VARCHAR2(100),
+    REGION_CODE         VARCHAR2(10),
+    AREA_MANAGER_ID     NUMBER(8),
+    OPEN_DATE           DATE,
+    CLOSE_DATE          DATE,
+    STORE_TYPE          VARCHAR2(20),
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    CONSTRAINT PK_STG_STORE PRIMARY KEY (STORE_ID)
+);
+
+-- ---------------------------------------------------------------------------
+-- DIMENSION TABLES (SCD Type 2 with valid_from / valid_to / is_current)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE DIM_PRODUCT (
+    DIM_PRODUCT_KEY     NUMBER(12)     NOT NULL,
+    PRODUCT_ID          NUMBER(8)      NOT NULL,   -- natural key
+    PRODUCT_CODE        VARCHAR2(20),
+    PRODUCT_NAME        VARCHAR2(200),
+    CATEGORY_CODE       VARCHAR2(10),
+    CATEGORY_DESC       VARCHAR2(100),
+    SUBCATEGORY_CODE    VARCHAR2(10),
+    SUBCATEGORY_DESC    VARCHAR2(100),
+    SUPPLIER_ID         NUMBER(8),
+    COST_PRICE          NUMBER(12,4),
+    LIST_PRICE          NUMBER(12,4),
+    TAX_CLASS_CODE      VARCHAR2(10),
+    -- SCD Type 2 columns
+    VALID_FROM          DATE           NOT NULL,
+    VALID_TO            DATE           DEFAULT TO_DATE('9999-12-31','YYYY-MM-DD'),
+    IS_CURRENT          CHAR(1)        DEFAULT 'Y',
+    VERSION_NUM         NUMBER(4)      DEFAULT 1,
+    CREATED_BY          VARCHAR2(50),
+    CREATED_DATE        DATE           DEFAULT SYSDATE,
+    UPDATED_BY          VARCHAR2(50),
+    UPDATED_DATE        DATE,
+    CONSTRAINT PK_DIM_PRODUCT PRIMARY KEY (DIM_PRODUCT_KEY)
+);
+
+CREATE TABLE DIM_CUSTOMER (
+    DIM_CUSTOMER_KEY    NUMBER(12)     NOT NULL,
+    CUSTOMER_ID         NUMBER(10)     NOT NULL,   -- natural key
+    CUSTOMER_CODE       VARCHAR2(20),
+    FULL_NAME           VARCHAR2(200),
+    EMAIL               VARCHAR2(200),
+    PHONE               VARCHAR2(30),
+    REGION_CODE         VARCHAR2(10),
+    LOYALTY_TIER        VARCHAR2(20),
+    -- SCD Type 2 columns
+    VALID_FROM          DATE           NOT NULL,
+    VALID_TO            DATE           DEFAULT TO_DATE('9999-12-31','YYYY-MM-DD'),
+    IS_CURRENT          CHAR(1)        DEFAULT 'Y',
+    VERSION_NUM         NUMBER(4)      DEFAULT 1,
+    CREATED_DATE        DATE           DEFAULT SYSDATE,
+    UPDATED_DATE        DATE,
+    CONSTRAINT PK_DIM_CUSTOMER PRIMARY KEY (DIM_CUSTOMER_KEY)
+);
+
+CREATE TABLE DIM_STORE (
+    DIM_STORE_KEY       NUMBER(10)     NOT NULL,
+    STORE_ID            NUMBER(6)      NOT NULL,
+    STORE_CODE          VARCHAR2(10),
+    STORE_NAME          VARCHAR2(100),
+    REGION_CODE         VARCHAR2(10),
+    STORE_TYPE          VARCHAR2(20),
+    VALID_FROM          DATE           NOT NULL,
+    VALID_TO            DATE           DEFAULT TO_DATE('9999-12-31','YYYY-MM-DD'),
+    IS_CURRENT          CHAR(1)        DEFAULT 'Y',
+    CREATED_DATE        DATE           DEFAULT SYSDATE,
+    CONSTRAINT PK_DIM_STORE PRIMARY KEY (DIM_STORE_KEY)
+);
+
+-- ---------------------------------------------------------------------------
+-- FACT TABLES
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE FACT_DAILY_SALES (
+    FACT_SALES_KEY      NUMBER(15)     NOT NULL,
+    DIM_PRODUCT_KEY     NUMBER(12)     NOT NULL,
+    DIM_CUSTOMER_KEY    NUMBER(12),
+    DIM_STORE_KEY       NUMBER(10),
+    TRANSACTION_DATE    DATE           NOT NULL,
+    FISCAL_YEAR         NUMBER(4),
+    FISCAL_MONTH        NUMBER(2),
+    FISCAL_WEEK         NUMBER(2),
+    QUANTITY            NUMBER(8,2),
+    UNIT_PRICE          NUMBER(12,4),
+    DISCOUNT_AMT        NUMBER(12,4),
+    GROSS_AMOUNT        NUMBER(16,4),
+    NET_AMOUNT          NUMBER(16,4),
+    TAX_AMOUNT          NUMBER(12,4),
+    REGION_CODE         VARCHAR2(10),
+    CURRENCY_CODE       VARCHAR2(3)    DEFAULT 'GBP',
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    LOAD_BATCH_ID       NUMBER(10),
+    CONSTRAINT PK_FACT_SALES PRIMARY KEY (FACT_SALES_KEY),
+    CONSTRAINT FK_FACT_PRODUCT  FOREIGN KEY (DIM_PRODUCT_KEY)  REFERENCES DIM_PRODUCT(DIM_PRODUCT_KEY),
+    CONSTRAINT FK_FACT_CUSTOMER FOREIGN KEY (DIM_CUSTOMER_KEY) REFERENCES DIM_CUSTOMER(DIM_CUSTOMER_KEY),
+    CONSTRAINT FK_FACT_STORE    FOREIGN KEY (DIM_STORE_KEY)    REFERENCES DIM_STORE(DIM_STORE_KEY)
+);
+
+-- Analytical summary - written to by PL/SQL, read by CRM repo
+CREATE TABLE FACT_REGIONAL_SUMMARY (
+    SUMMARY_KEY         NUMBER(15)     NOT NULL,
+    REGION_CODE         VARCHAR2(10)   NOT NULL,
+    SUMMARY_DATE        DATE           NOT NULL,
+    TOTAL_TRANSACTIONS  NUMBER(10),
+    TOTAL_QUANTITY      NUMBER(14,2),
+    TOTAL_REVENUE       NUMBER(18,4),
+    AVG_BASKET_SIZE     NUMBER(12,4),
+    DISTINCT_CUSTOMERS  NUMBER(10),
+    DISTINCT_PRODUCTS   NUMBER(8),
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    LOAD_BATCH_ID       NUMBER(10),
+    CONSTRAINT PK_FACT_REGIONAL PRIMARY KEY (SUMMARY_KEY)
+);
+
+-- ---------------------------------------------------------------------------
+-- SEQUENCES
+-- ---------------------------------------------------------------------------
+CREATE SEQUENCE SEQ_DIM_PRODUCT_KEY  START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_DIM_CUSTOMER_KEY START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_DIM_STORE_KEY    START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_FACT_SALES_KEY   START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_FACT_REGIONAL    START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_BATCH_ID         START WITH 1    INCREMENT BY 1 NOCACHE;
+
+-- ---------------------------------------------------------------------------
+-- INDEXES
+-- ---------------------------------------------------------------------------
+CREATE INDEX IDX_STG_SALES_DATE    ON STG_SALES_TRANSACTIONS(TRANSACTION_DATE, REGION_CODE);
+CREATE INDEX IDX_STG_SALES_STATUS  ON STG_SALES_TRANSACTIONS(ETL_STATUS, LOAD_DATE);
+CREATE INDEX IDX_DIM_PROD_CURR     ON DIM_PRODUCT(PRODUCT_ID, IS_CURRENT, VALID_TO);
+CREATE INDEX IDX_DIM_CUST_CURR     ON DIM_CUSTOMER(CUSTOMER_ID, IS_CURRENT, VALID_TO);
+CREATE INDEX IDX_FACT_DATE_REG     ON FACT_DAILY_SALES(TRANSACTION_DATE, REGION_CODE);
+CREATE INDEX IDX_FACT_PROD         ON FACT_DAILY_SALES(DIM_PRODUCT_KEY, TRANSACTION_DATE);
+CREATE INDEX IDX_REGIONAL_DATE     ON FACT_REGIONAL_SUMMARY(SUMMARY_DATE, REGION_CODE);
+
+-- Grant read on shared staging to CRM schema
+GRANT SELECT ON STG_CUSTOMER_SALES   TO CRM_SCHEMA;
+GRANT SELECT ON FACT_REGIONAL_SUMMARY TO CRM_SCHEMA;
+GRANT SELECT ON FACT_REGIONAL_SUMMARY TO FINANCE_SCHEMA;

@@ -1,0 +1,233 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Automic (UC4) Workflow Export
+    Workflow  : RETAIL_DAILY_WORKFLOW
+    System    : Retail Data Warehouse ETL
+    Schedule  : Daily, Monday-Sunday at 02:00 (runs after source extract completes)
+    Owner     : DW_TEAM
+    Version   : 3.2
+    Last Mod  : 2024-01-10
+
+    Cross-repo dependency:
+      - FINANCE_DAILY_GL_CLOSE must complete before RETAIL_REGIONAL_NORTH
+        (shared customer data dependency)
+      - Output feeds into: CRM_WEEKLY_WORKFLOW (crm_analytics_legacy)
+-->
+<UC4_WORKFLOW name="RETAIL_DAILY_WORKFLOW" type="JOBP" client="100" version="3.2">
+
+    <HEADER>
+        <DESCRIPTION>Daily retail sales ETL: staging extract, dimension load, fact load, regional summaries</DESCRIPTION>
+        <CATEGORY>DW_RETAIL</CATEGORY>
+        <PRIORITY>50</PRIORITY>
+        <MAX_PARALLEL_TASKS>4</MAX_PARALLEL_TASKS>
+        <CALENDAR>BUSINESS_DAYS</CALENDAR>
+        <SCHEDULE_TIME>02:00</SCHEDULE_TIME>
+        <TIMEZONE>Europe/London</TIMEZONE>
+    </HEADER>
+
+    <VARIABLES>
+        <VAR name="LOAD_DATE"    type="DATE"   format="YYYY-MM-DD" value="&amp;$TODAY-1D"/>
+        <VAR name="BATCH_ID"     type="STRING" value="&amp;$TODAY_YYYYMMDD"/>
+        <VAR name="RETRY_MAX"    type="NUMBER" value="3"/>
+        <VAR name="RETRY_WAIT"   type="NUMBER" value="60"/>
+        <VAR name="NOTIFY_EMAIL" type="STRING" value="dw-alerts@company.com"/>
+        <VAR name="ENV"          type="STRING" value="PROD"/>
+    </VARIABLES>
+
+    <!-- ============================================================
+         JOB 1: Pre-check - Verify source system availability
+         No predecessors (first in chain)
+    ============================================================ -->
+    <JOB name="RETAIL_PRE_CHECK" type="JOBS" task_id="1">
+        <DESCRIPTION>Verify source Oracle POS system is accessible and data is available</DESCRIPTION>
+        <AGENT>ETL_AGENT_01</AGENT>
+        <LOGIN>ORACLE_DW_LOGIN</LOGIN>
+        <COMMAND type="INLINE_SCRIPT">
+            <![CDATA[
+            sqlplus -s ${DB_USER}/${DB_PASS}@${DB_SID} <<EOF
+              SELECT COUNT(*) FROM SOURCE_OPS.SALES_TXN
+              WHERE TRUNC(TXN_DATETIME) = TO_DATE('&LOAD_DATE','YYYY-MM-DD');
+              EXIT;
+EOF
+            ]]>
+        </COMMAND>
+        <PREDECESSORS/>
+        <ON_SUCCESS next_task="RETAIL_STG_EXTRACT_NORTH,RETAIL_STG_EXTRACT_SOUTH"/>
+        <ON_FAILURE action="NOTIFY_AND_ABORT" notify="&NOTIFY_EMAIL"/>
+        <RETRY max_retries="2" wait_seconds="120"/>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 2a: Staging Extract - NORTH Region
+    ============================================================ -->
+    <JOB name="RETAIL_STG_EXTRACT_NORTH" type="JOBS" task_id="2">
+        <DESCRIPTION>Extract NORTH region sales transactions into staging</DESCRIPTION>
+        <AGENT>ETL_AGENT_01</AGENT>
+        <LOGIN>ORACLE_DW_LOGIN</LOGIN>
+        <SCRIPT_NAME>load_daily_sales.ksh</SCRIPT_NAME>
+        <SCRIPT_ARGS>&amp;LOAD_DATE NORTH &amp;BATCH_MODE</SCRIPT_ARGS>
+        <WORKING_DIR>/opt/etl/scripts</WORKING_DIR>
+        <PREDECESSORS>
+            <PREDECESSOR job="RETAIL_PRE_CHECK" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="RETAIL_PRODUCT_MASTER_LOAD"/>
+        <ON_FAILURE action="NOTIFY" notify="&NOTIFY_EMAIL" then="ABORT"/>
+        <RETRY max_retries="&RETRY_MAX" wait_seconds="&RETRY_WAIT"/>
+        <TIMEOUT_MINUTES>90</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 2b: Staging Extract - SOUTH Region (parallel with NORTH)
+    ============================================================ -->
+    <JOB name="RETAIL_STG_EXTRACT_SOUTH" type="JOBS" task_id="3">
+        <DESCRIPTION>Extract SOUTH region sales transactions into staging</DESCRIPTION>
+        <AGENT>ETL_AGENT_02</AGENT>
+        <LOGIN>ORACLE_DW_LOGIN</LOGIN>
+        <SCRIPT_NAME>load_daily_sales.ksh</SCRIPT_NAME>
+        <SCRIPT_ARGS>&amp;LOAD_DATE SOUTH &amp;BATCH_MODE</SCRIPT_ARGS>
+        <WORKING_DIR>/opt/etl/scripts</WORKING_DIR>
+        <PREDECESSORS>
+            <PREDECESSOR job="RETAIL_PRE_CHECK" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="RETAIL_PRODUCT_MASTER_LOAD"/>
+        <ON_FAILURE action="NOTIFY" notify="&NOTIFY_EMAIL" then="ABORT"/>
+        <RETRY max_retries="&RETRY_MAX" wait_seconds="&RETRY_WAIT"/>
+        <TIMEOUT_MINUTES>90</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 3: Product Master Load (waits for both regions' extract)
+         Cross-repo predecessor: depends on FINANCE_DAILY_GL_CLOSE
+         from finance_etl_legacy to ensure shared reference data is ready
+    ============================================================ -->
+    <JOB name="RETAIL_PRODUCT_MASTER_LOAD" type="JOBS" task_id="4">
+        <DESCRIPTION>Load product master SCD Type 2 dimension from source</DESCRIPTION>
+        <AGENT>ETL_AGENT_01</AGENT>
+        <LOGIN>ORACLE_DW_LOGIN</LOGIN>
+        <SCRIPT_NAME>load_product_master.ksh</SCRIPT_NAME>
+        <SCRIPT_ARGS>&amp;LOAD_DATE &amp;RETRY_MAX &amp;RETRY_WAIT</SCRIPT_ARGS>
+        <WORKING_DIR>/opt/etl/scripts</WORKING_DIR>
+        <PREDECESSORS>
+            <PREDECESSOR job="RETAIL_STG_EXTRACT_NORTH" condition="SUCCESS"/>
+            <PREDECESSOR job="RETAIL_STG_EXTRACT_SOUTH" condition="SUCCESS"/>
+            <!-- Cross-workflow dependency: Finance must close GL before product prices are final -->
+            <PREDECESSOR workflow="FINANCE_DAILY_WORKFLOW" job="FINANCE_DAILY_GL_CLOSE" condition="SUCCESS" external="true"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="RETAIL_ABINITIO_TRANSFORM"/>
+        <ON_FAILURE action="NOTIFY_AND_ABORT" notify="&NOTIFY_EMAIL"/>
+        <RETRY max_retries="&RETRY_MAX" wait_seconds="&RETRY_WAIT"/>
+        <TIMEOUT_MINUTES>60</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 4: Ab Initio Graph Execution - Sales Rollup Transform
+    ============================================================ -->
+    <JOB name="RETAIL_ABINITIO_TRANSFORM" type="JOBS" task_id="5">
+        <DESCRIPTION>Run Ab Initio sales_rollup.xfr graph to aggregate regional summaries</DESCRIPTION>
+        <AGENT>ABINITIO_AGENT_01</AGENT>
+        <LOGIN>ABINITIO_LOGIN</LOGIN>
+        <COMMAND type="AIR_COMMAND">
+            <![CDATA[
+            air sandbox run retail_sales_transform/sales_rollup.xfr \
+                -param LOAD_DATE=&LOAD_DATE \
+                -param REGION_CODE=ALL \
+                -param ORA_CONNECT_STRING=${ORA_CONNECT_STRING} \
+                -param AB_PARALLELISM=4
+            ]]>
+        </COMMAND>
+        <PREDECESSORS>
+            <PREDECESSOR job="RETAIL_PRODUCT_MASTER_LOAD" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="RETAIL_SPARK_AGGREGATION"/>
+        <ON_FAILURE action="NOTIFY" notify="&NOTIFY_EMAIL" then="ABORT"/>
+        <TIMEOUT_MINUTES>120</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 5: Spark Aggregation Job
+    ============================================================ -->
+    <JOB name="RETAIL_SPARK_AGGREGATION" type="JOBS" task_id="6">
+        <DESCRIPTION>Run Spark sales_aggregation.scala job for analytical layer</DESCRIPTION>
+        <AGENT>SPARK_AGENT_01</AGENT>
+        <LOGIN>SPARK_CLUSTER_LOGIN</LOGIN>
+        <COMMAND type="SPARK_SUBMIT">
+            <![CDATA[
+            spark-submit \
+              --class com.company.retail.SalesAggregation \
+              --master yarn \
+              --deploy-mode cluster \
+              --num-executors 8 \
+              --executor-memory 4g \
+              /opt/spark/jobs/retail-etl-assembly.jar \
+              --load-date &LOAD_DATE \
+              --env &ENV
+            ]]>
+        </COMMAND>
+        <PREDECESSORS>
+            <PREDECESSOR job="RETAIL_ABINITIO_TRANSFORM" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="RETAIL_DATA_QUALITY_CHECK"/>
+        <ON_FAILURE action="NOTIFY" notify="&NOTIFY_EMAIL" then="ABORT"/>
+        <TIMEOUT_MINUTES>60</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 6: Data Quality Check
+    ============================================================ -->
+    <JOB name="RETAIL_DATA_QUALITY_CHECK" type="JOBS" task_id="7">
+        <DESCRIPTION>Run Python DQ checks on loaded data</DESCRIPTION>
+        <AGENT>ETL_AGENT_01</AGENT>
+        <LOGIN>PYTHON_ETL_LOGIN</LOGIN>
+        <COMMAND type="PYTHON_SCRIPT">
+            <![CDATA[
+            python3 /opt/etl/python/retail_data_quality.py \
+                --load-date &LOAD_DATE \
+                --env &ENV \
+                --notify-email &NOTIFY_EMAIL
+            ]]>
+        </COMMAND>
+        <PREDECESSORS>
+            <PREDECESSOR job="RETAIL_SPARK_AGGREGATION" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="RETAIL_COMPLETION_NOTIFY"/>
+        <ON_FAILURE action="NOTIFY" notify="&NOTIFY_EMAIL" then="CONTINUE"/>
+        <!-- DQ failures are warnings, not blockers -->
+    </JOB>
+
+    <!-- ============================================================
+         JOB 7: Completion Notification
+         Successor: triggers CRM_WEEKLY_WORKFLOW check (crm_analytics_legacy)
+    ============================================================ -->
+    <JOB name="RETAIL_COMPLETION_NOTIFY" type="JOBS" task_id="8">
+        <DESCRIPTION>Send completion notification and raise event for CRM workflow</DESCRIPTION>
+        <AGENT>ETL_AGENT_01</AGENT>
+        <COMMAND type="INLINE_SCRIPT">
+            <![CDATA[
+            echo "RETAIL_DAILY_WORKFLOW completed for LOAD_DATE=&LOAD_DATE" | \
+                mailx -s "[ETL-OK] Retail Daily Load &LOAD_DATE" &NOTIFY_EMAIL
+            # Publish completion event for CRM workflow to consume
+            uc4api publish_event RETAIL_DAILY_COMPLETE date=&LOAD_DATE
+            ]]>
+        </COMMAND>
+        <PREDECESSORS>
+            <PREDECESSOR job="RETAIL_DATA_QUALITY_CHECK" condition="SUCCESS_OR_WARNING"/>
+        </PREDECESSORS>
+        <!-- This job's SUCCESS is consumed by CRM_WEEKLY_WORKFLOW as external predecessor -->
+        <PUBLISHED_EVENTS>
+            <EVENT name="RETAIL_DAILY_COMPLETE" value="&LOAD_DATE"/>
+        </PUBLISHED_EVENTS>
+    </JOB>
+
+    <SCHEDULE>
+        <TRIGGER type="TIME" time="02:00" days="MON,TUE,WED,THU,FRI,SAT,SUN" timezone="Europe/London"/>
+        <TRIGGER type="MANUAL"/>
+    </SCHEDULE>
+
+    <NOTIFICATIONS>
+        <ON_WORKFLOW_FAILURE  recipients="dw-alerts@company.com" subject="[CRITICAL] RETAIL_DAILY_WORKFLOW FAILED"/>
+        <ON_WORKFLOW_SUCCESS  recipients="dw-ops@company.com"    subject="[OK] RETAIL_DAILY_WORKFLOW completed"/>
+        <ON_WORKFLOW_TIMEOUT  recipients="dw-alerts@company.com" subject="[TIMEOUT] RETAIL_DAILY_WORKFLOW exceeded SLA"/>
+        <SLA_MINUTES>240</SLA_MINUTES>
+    </NOTIFICATIONS>
+
+</UC4_WORKFLOW>

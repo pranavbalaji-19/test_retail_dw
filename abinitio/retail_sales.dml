@@ -1,0 +1,87 @@
+-- =============================================================================
+-- Ab Initio DML Schema File
+-- Project  : retail_sales_transform
+-- File     : retail_sales.dml
+-- Purpose  : Defines record schemas for the retail sales transformation graph.
+--            Used by sales_rollup.xfr components for field typing and mapping.
+-- =============================================================================
+
+-- Input schema: raw transaction records from STG_SALES_TRANSACTIONS
+define record stg_sales_record(
+    transaction_id      decimal(12,0),
+    customer_id         decimal(10,0),
+    product_id          decimal(8,0),
+    store_id            decimal(6,0),
+    transaction_date    date("YYYY-MM-DD"),
+    quantity            decimal(8,2),
+    unit_price          decimal(12,4),
+    discount_amt        decimal(12,4),
+    discount_pct        decimal(5,2),
+    region_code         string(10),
+    currency_code       string(3),
+    payment_method      string(20),
+    load_batch_id       decimal(10,0)
+);
+
+-- Enriched record after product dimension lookup join
+define record enriched_sales_record(
+    transaction_id      decimal(12,0),
+    customer_id         decimal(10,0),
+    product_id          decimal(8,0),
+    product_code        string(20),
+    product_name        string(200),
+    category_code       string(10),
+    subcategory_code    string(10),
+    store_id            decimal(6,0),
+    transaction_date    date("YYYY-MM-DD"),
+    quantity            decimal(8,2),
+    unit_price          decimal(12,4),
+    discount_amt        decimal(12,4),
+    gross_amount        decimal(16,4),
+    net_amount          decimal(16,4),
+    region_code         string(10),
+    currency_code       string(3),
+    loyalty_tier        string(20),
+    fiscal_year         decimal(4,0),
+    fiscal_month        decimal(2,0)
+);
+
+-- Output schema: regional daily summary aggregation
+define record regional_summary_record(
+    region_code             string(10),
+    summary_date            date("YYYY-MM-DD"),
+    category_code           string(10),
+    total_transactions      decimal(10,0),
+    total_quantity          decimal(14,2),
+    total_gross_revenue     decimal(18,4),
+    total_net_revenue       decimal(18,4),
+    total_discount_amount   decimal(14,4),
+    avg_basket_value        decimal(12,4),
+    distinct_customers      decimal(10,0),
+    distinct_products       decimal(8,0),
+    distinct_stores         decimal(6,0),
+    fiscal_year             decimal(4,0),
+    fiscal_month            decimal(2,0)
+);
+
+-- Rejected records schema (for error output port)
+define record rejected_record(
+    transaction_id      decimal(12,0),
+    region_code         string(10),
+    transaction_date    date("YYYY-MM-DD"),
+    rejection_reason    string(200),
+    rejected_at         datetime("YYYY-MM-DD HH:MM:SS")
+);
+
+-- Lookup schema: product dimension join key
+define record product_dim_lookup(
+    product_id          decimal(8,0),
+    product_code        string(20),
+    product_name        string(200),
+    category_code       string(10),
+    subcategory_code    string(10),
+    list_price          decimal(12,4),
+    is_current          string(1),
+    valid_from          date("YYYY-MM-DD"),
+    valid_to            date("YYYY-MM-DD")
+);
